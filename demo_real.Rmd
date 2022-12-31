@@ -1,0 +1,314 @@
+---
+title: "demo"
+output: pdf_document
+date: "2022-12-23"
+---
+
+JUST WRITE SOME SHIT
+
+
+```{r}
+library(balanceHD)
+
+#set.seed(123456)
+repli=1
+tau.vec<-c()
+for(i in 1:repli){
+  if(i%%10==1)print(i)
+  n = 400
+  p = 1000
+  tau = 7
+  nclust = 10
+  beta = 2 / (1:p) / sqrt(sum(1/(1:p)^2))
+  clust.ptreat = rep(c(0.1, 0.9), nclust/2)
+  
+  cluster.center = 0.5 * matrix(rnorm(nclust * p), nclust, p)
+  cluster = sample.int(nclust, n, replace = TRUE)
+  X = cluster.center[cluster,] + matrix(rnorm(n * p), n, p)
+  W = rbinom(n, 1, clust.ptreat[cluster])
+  Y = X %*% beta + rnorm(n, 0, 1) + tau * W
+  
+  tau.hat = balanceHD::residualBalance.ate(X, Y, W, optimizer = "quadprog", bound.gamma = F, estimate.se = TRUE)
+  tau.vec<-c(tau.vec,tau.hat)
+  }
+```
+
+```{r}
+tau.vec
+```
+
+
+
+# eda
+```{r}
+library(causaldata)
+data("adult_services")
+data("nhefs_complete")
+```
+
+
+
+```{r}
+hist(adult_services$lnw)
+unique(adult_services$id)
+
+times<-c()
+for(i in unique(adult_services$id)){
+  times<- c(times, sum(adult_services$id==i, na.rm = T))
+}
+table(times)
+```
+
+
+```{r}
+table(adult_services$session)
+
+table(adult_services$asian)
+table(adult_services$black)
+table(adult_services$hispanic)
+table(adult_services$white)
+table(adult_services$other)
+```
+
+```{r}
+table(adult_services$hot)
+```
+
+```{r}
+adult<-na.omit(adult_services)
+```
+
+```{r}
+table(adult$hot)
+```
+
+
+```{r}
+summary(lm(lnw~.-id-white-widowed,adult_services))
+
+```
+```{r}
+rowSums(adult_services[,26:31])
+
+```
+
+
+```{r}
+table(adult_services$asian_cl)
+table(adult_services$black_cl)
+table(adult_services$hispanic_cl)
+table(adult_services$othrace_cl)
+```
+
+
+```{r}
+X=as.matrix(adult[,c(-1,-24,-31,-17,-15)])
+Y=as.matrix(adult$lnw)
+W=as.matrix(adult$hot)
+tau.hat = residualBalance.ate(X, Y, W, estimate.se = TRUE)
+print(paste("true tau:", tau))
+print(paste("point estimate:", tau.hat[1]))
+print(paste0("95% CI for tau: (", tau.hat[1] - 1.96 * tau.hat[2], ", ", tau.hat[1] + 1.96 * tau.hat[2], ")"))
+```
+
+```{r}
+elnet.ate(as.matrix(X), as.matrix(Y), as.matrix(W), target.pop = c(0, 1), alpha = 0.9, estimate.se = T)
+ipw.ate(X, Y, W, estimate.se = T)
+naive.ate(X, Y, W, estimate.se = T)
+twostep.lasso.ate(X, Y, W, target.pop = c(0, 1), fit.propensity = TRUE,
+  estimate.se = T)
+```
+
+
+```{r}
+mean(adult[adult$hot==1,"lnw"]$lnw)-mean(adult[adult$hot==0,"lnw"]$lnw)
+
+
+colMeans(adult[adult$white==1,])-colMeans(adult[adult$asian==1,])
+```
+
+
+
+```{r}
+library(glmnet)
+cv_model <- cv.glmnet(cbind(X,W), Y, alpha = 1)
+plot(cv_model)
+#find optimal lambda value that minimizes test MSE
+best_lambda <- cv_model$lambda.min
+best_lambda
+best_model<-glmnet(cbind(X,W),Y, alpha = 1, lambda = best_lambda)
+
+coef(best_model)
+```
+
+
+# unique
+
+```{r}
+hist(adult$lnw)
+unique(adult$id)
+
+times<-c()
+for(i in unique(adult$id)){
+  times<- c(times, sum(adult$id==i))
+}
+table(times)
+table(adult$session)
+```
+
+```{r}
+adult_unique<-data.frame()
+for(i in unique(adult$id)){
+  adult_unique<-rbind(adult_unique,
+                      adult[sample((1:nrow(adult))[adult$id==i],1),])
+}
+```
+
+```{r}
+mean(adult_unique[adult_unique$hot==1,"lnw"]$lnw)-mean(adult_unique[adult_unique$hot==0,"lnw"]$lnw)
+
+
+colMeans(adult_unique[adult_unique$white==1,])-colMeans(adult_unique[adult_unique$asian==1,])
+```
+
+
+```{r}
+X=as.matrix(adult_unique[,c(-1,-24,-31,-17,-15)])
+Y=as.matrix(adult_unique$lnw)
+W=as.matrix(adult_unique$hot)
+residualBalance.ate(X, Y, W, estimate.se = TRUE)
+```
+
+```{r}
+elnet.ate(as.matrix(X), as.matrix(Y), as.matrix(W), target.pop = c(0, 1), alpha = 0.9, estimate.se = T)
+ipw.ate(X, Y, W, estimate.se = T)
+naive.ate(X, Y, W, estimate.se = T)
+twostep.lasso.ate(X, Y, W, target.pop = c(0, 1), fit.propensity = TRUE,
+  estimate.se = T)
+```
+
+```{r}
+library(glmnet)
+cv_model <- cv.glmnet(cbind(X,W), Y, alpha = 1)
+plot(cv_model)
+#find optimal lambda value that minimizes test MSE
+best_lambda <- cv_model$lambda.min
+best_lambda
+best_model<-glmnet(cbind(X,W),Y, alpha = 1, lambda = best_lambda)
+
+coef(best_model)
+```
+
+# unique random sampling
+```{r}
+ind1<-sample(1:nrow(adult_unique),ceiling(nrow(adult_unique)/2))
+ind2<-(1:nrow(adult_unique))[-ind1]
+
+X=as.matrix(adult_unique[,c(-1,-24,-31,-17)])
+Y=as.matrix(adult_unique$lnw)
+Y[ind1,]=Y[ind1,]+rnorm(length(ind1),0,0.5)-adult_unique$bmi[ind1]*0.1+
+  adult_unique$hot[ind1]*1+adult_unique$unsafe[ind1]*1
+W=as.matrix(numeric(nrow(adult_unique)))
+W[ind1,]=1
+residualBalance.ate(X, Y, W, estimate.se = TRUE)
+
+mean(-adult_unique$bmi[ind1]*0.1+adult_unique$hot[ind1]*1+
+  adult_unique$unsafe[ind1]*1)
+```
+
+```{r}
+elnet.ate(as.matrix(X), as.matrix(Y), as.matrix(W), target.pop = c(0, 1), alpha = 0.9, estimate.se = T)
+ipw.ate(X, Y, W, estimate.se = T)
+naive.ate(X, Y, W, estimate.se = T)
+twostep.lasso.ate(X, Y, W, target.pop = c(0, 1), fit.propensity = TRUE,
+  estimate.se = T)
+```
+
+```{r}
+set.seed(114514)
+repli=100
+result_unique=matrix(0,repli,8)
+true_unique=numeric(repli)
+
+for(i in 1:repli){
+  ind1<-sample(1:nrow(adult_unique),ceiling(nrow(adult_unique)/2))
+  ind2<-(1:nrow(adult_unique))[-ind1]
+  
+  X=as.matrix(adult_unique[,c(-1,-24,-31,-17)])
+  Y=as.matrix(adult_unique$lnw)
+  Y[ind1,]=Y[ind1,]+rnorm(length(ind1),0,0.5)-adult_unique$bmi[ind1]*0.1+
+  adult_unique$hot[ind1]*1+adult_unique$unsafe[ind1]*1
+  W=as.matrix(numeric(nrow(adult_unique)))
+  W[ind1,]=1
+  true_unique[i]=mean(-adult_unique$bmi[ind1]*0.1+
+  adult_unique$hot[ind1]*1+adult_unique$unsafe[ind1]*1)
+    
+  result_unique[i,1:2]=residualBalance.ate(X, Y, W, estimate.se = TRUE)
+  
+  result_unique[i,3:4]=elnet.ate(as.matrix(X), as.matrix(Y), as.matrix(W), target.pop = c(0, 1), alpha = 0.9, estimate.se = T)
+  result_unique[i,5:6]=ipw.ate(X, Y, W, estimate.se = T)
+  result_unique[i,7:8]=naive.ate(X, Y, W, estimate.se = T)
+}
+```
+
+
+```{r}
+colMeans(sqrt((result_unique[,c(1,3,5,7)]-true_unique)^2))
+colMeans(result_unique[,c(2,4,6,8)])
+apply(result_unique[,c(1,3,5,7)],2,sd)
+```
+
+# adult random sampling
+```{r}
+ind1<-sample(1:nrow(adult),ceiling(nrow(adult)/2))
+```
+
+
+```{r}
+X=as.matrix(adult[,c(-1,-24,-31,-17,-15)])
+Y=as.matrix(adult$lnw)
+Y[ind1,]=Y[ind1,]+rnorm(length(ind1),2,0.5)+
+W=as.matrix(numeric(nrow(adult)))
+W[ind1,]=1
+tau.hat = residualBalance.ate(X, Y, W, optimizer = "quadprog", bound.gamma = FALSE, estimate.se = TRUE)
+print(paste("point estimate:", tau.hat[1]))
+print(paste0("95% CI for tau: (", tau.hat[1] - 1.96 * tau.hat[2], ", ", tau.hat[1] + 1.96 * tau.hat[2], ")"))
+```
+
+```{r}
+elnet.ate(as.matrix(X), as.matrix(Y), as.matrix(W), target.pop = c(0, 1), alpha = 0.9, estimate.se = T)
+ipw.ate(X, Y, W, estimate.se = T)
+naive.ate(X, Y, W, estimate.se = T)
+twostep.lasso.ate(X, Y, W, target.pop = c(0, 1), fit.propensity = TRUE,
+  estimate.se = T)
+```
+
+```{r}
+set.seed(114514)
+repli=100
+result=matrix(0,repli,8)
+
+for(i in 1:repli){
+  ind1<-sample(1:nrow(adult),ceiling(nrow(adult)/2))
+  ind2<-(1:nrow(adult))[-ind1]
+  
+  X=as.matrix(adult[,c(-1,-24,-31,-17)])
+  Y=as.matrix(adult$lnw)
+  Y[ind1,]=Y[ind1,]+rnorm(length(ind1),2,0.5)
+  W=as.matrix(numeric(nrow(adult)))
+  W[ind1,]=1
+  result[i,1:2]=residualBalance.ate(X, Y, W, estimate.se = TRUE)
+  
+  result[i,3:4]=elnet.ate(as.matrix(X), as.matrix(Y), as.matrix(W), target.pop = c(0, 1), alpha = 0.9, estimate.se = T)
+  result[i,5:6]=ipw.ate(X, Y, W, estimate.se = T)
+  result[i,7:8]=naive.ate(X, Y, W, estimate.se = T)
+}
+```
+
+```{r}
+colMeans(sqrt((result[,c(1,3,5,7)]-2)^2))
+colMeans(result[,c(2,4,6,8)])
+apply(result[,c(1,3,5,7)],2,sd)
+```
+
+
