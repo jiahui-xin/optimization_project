@@ -1,3 +1,3 @@
 "something meaningless"
 123
-just for test
+print("just for test")
