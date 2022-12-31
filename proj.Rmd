@@ -1,0 +1,811 @@
+---
+title: "proj"
+output: html_document
+date: "2022-12-25"
+---
+
+```{r}
+#install balanceHD from https://github.com/swager/balanceHD first. install other packages if needed.
+library(balanceHD)
+library(doParallel)
+library(doRNG)
+detectCores()
+registerDoParallel(detectCores()-4)
+```
+
+
+# illustation
+
+
+```{r, fig.width=4, fig.height=4}
+seed=114514
+ptreat=c(0.25,0.74)
+p=2
+n=2000
+set.seed(seed)
+    nclust = 10
+      
+      clust.ptreat = rep(ptreat, nclust/2)
+      
+      cluster.center = 5*matrix(rnorm(nclust * p), nclust, p)
+      cluster = sample.int(nclust, n, replace = TRUE)
+      X = cluster.center[cluster,] + matrix(rnorm(n * p), n, p)
+      W = rbinom(n, 1, clust.ptreat[cluster])
+col.vec<-c("blue","red")
+plot(X,col=col.vec[W+1])
+```
+
+
+
+
+
+## modified method
+```{r}
+#' Compute approximately balancing weights
+#'
+#' Returns the minimizer of:
+#'   (1 - zeta) ||gamma||^2 + zeta ||M'gamma - balance.target||_infty^2 (*)
+#'
+#' @param M the feature matrix, see (*)
+#' @param balance.target the target solution, see (*)
+#' @param zeta tuning parameter, see (*)
+#' @param allow.negative.weights are the gammas allowed to be negative?
+#' @param optimizer Which optimizer to use? Mosek is a commercial solver, but free
+#'                  academic licenses are available. Needs to be installed separately.
+#'                  Pogs runs ADMM and may be useful for large problems, and
+#'                  must be installed separately. Quadprog is the default
+#'                  R solver.
+#' @param bound.gamma whether upper bound on gamma should be imposed
+#' @param gamma.max specific upper bound for gamma (ignored if bound.gamma = FALSE)
+#' @param verbose whether the optimizer should print progress information
+#'
+#' @return gamma, the minimizer of (*)
+#'
+#' @export approx.balance
+approx.balance1 = function(M,
+                          balance.target,
+                          zeta = 0.5,
+                          allow.negative.weights = FALSE,
+                          optimizer = c("mosek", "pogs", "pogs.dual", "quadprog"),
+                          bound.gamma = FALSE,
+                          gamma.max = 1/nrow(M)^(2/3),
+                          verbose = FALSE) {
+
+  if (zeta <= 0 || zeta >= 1) {
+    stop("approx.balance: zeta must be between 0 and 1")
+  }
+
+  optimizer = match.arg(optimizer)
+  if (optimizer == "quadprog") {
+    if (bound.gamma) {warning("bound.gamma = TRUE not implemented for this optimizer")}
+    gamma = approx.balance.quadprog1(M, balance.target, zeta, allow.negative.weights)
+  }
+
+  gamma
+}
+
+# Find approximately balancing weights using quadprog
+approx.balance.quadprog1 = function(M,
+                                   balance.target,
+                                   zeta = 0.5,
+                                   allow.negative.weights = FALSE) {
+  # The system is effectively
+  # minimize zeta * delta^2 + (1 - zeta) * ||gamma||^2
+  # subject to
+  #   sum gamma = 1
+  # Here delta = ||M'gamma - balance.target||_2
+
+  LB = 1/nrow(M)/10000
+  Dmat = M%*%t(M)+(1-zeta)*diag(rep(1,nrow(M)))
+  dvec = 2*M%*%balance.target*zeta
+  Amat = cbind(-rep(1, nrow(M)),rep(1, nrow(M)))
+  bvec = c(-1-LB,1-LB)
+
+  if (!allow.negative.weights) {
+    LB = 1/nrow(M)/10000
+    Amat = cbind(Amat, diag(rep(1, nrow(M))))
+    bvec = c(bvec, rep(LB, nrow(M)))
+  }
+
+  balance.soln = quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq = 1)
+  gamma = balance.soln$solution
+  gamma
+}
+
+#' Estimate mean outcome at balance.target via residual balancing
+#'
+#' @param XW the input features for the sub-population of interest
+#' @param YW the observed responses for the sub-population of interest
+#' @param balance.target the desired center of the dataset
+#' @param allow.negative.weights whether negative gammas are allowed for balancing
+#' @param zeta tuning parameter for selecting approximately balancing weights
+#' @param fit.method the method used to fit mu(x) = E[YW | XW = x]
+#' @param alpha tuning paramter for glmnet
+#' @param optimizer which optimizer to use for approximate balancing
+#' @param bound.gamma whether upper bound on gamma should be imposed
+#' @param verbose whether the optimizer should print progress information
+#'
+#' @return Estimate for E[YW | XW = balance.target], along with variance estimate
+#'
+#' @export residualBalance.mean
+residualBalance.mean1 = function(XW, YW,
+                                balance.target,
+                                allow.negative.weights = FALSE,
+                                zeta,
+                                fit.method = c("elnet", "none", "ols"),
+                                alpha,
+                                optimizer = c("mosek", "pogs", "pogs.dual", "quadprog"),
+                                bound.gamma = TRUE,
+                                verbose = FALSE) {
+  
+  fit.method = match.arg(fit.method)
+  optimizer = match.arg(optimizer)
+  
+  gamma = approx.balance1(XW, balance.target, zeta = zeta, allow.negative.weights = allow.negative.weights, optimizer = optimizer, bound.gamma=bound.gamma, verbose=verbose)
+  
+  if (fit.method == "elnet") {
+    
+    lasso.fit = glmnet::cv.glmnet(XW, YW, alpha = alpha)
+    mu.lasso = predict(lasso.fit, newx = matrix(balance.target, 1, length(balance.target)))
+    
+    residuals = YW - predict(lasso.fit, newx = XW)
+    mu.residual = sum(gamma * residuals)
+    
+    var.hat = sum(gamma^2 * residuals^2) *
+      # degrees of freedom correction
+      length(gamma) / max(1, length(gamma) - sum(coef(lasso.fit) != 0))
+    
+  } else if (fit.method == "none") {
+    
+    mu.lasso = 0
+    mu.residual = sum(gamma * YW)
+    
+    var.hat = NA
+    
+  } else if (fit.method == "ols"){
+    ols.fit <-lm(YW~XW)
+    mu.lasso = predict(ols.fit)
+    residuals = ols.fit$residuals
+    mu.residual = sum(gamma * residuals)
+    
+    var.hat = NA
+    
+    
+  } else {
+    
+    stop("Invalid choice of fitting method.")
+    
+  }
+  
+  mu.hat = mu.lasso + mu.residual
+  c(mu.hat, var.hat)
+}
+
+
+#' Estimate ATE via approximate residual balancing
+#'
+#' @param X the input features
+#' @param Y the observed responses
+#' @param W treatment/control assignment, coded as 0/1
+#' @param target.pop which population should the treatment effect be estimated for?
+#'            (0, 1): average treatment effect for everyone
+#'            0: average treatment effect for controls
+#'            1: average treatment effect for treated
+#' @param allow.negative.weights whether negative gammas are allowed for balancing
+#' @param zeta tuning parameter for selecting approximately balancing weights
+#' @param fit.method the method used to fit mu(x, w) = E[Y | X = x, W = w]
+#' @param alpha tuning paramter for glmnet
+#' @param scale.X whether non-binary features should be noramlized
+#' @param estimate.se whether to return estimate of standard error
+#' @param optimizer which optimizer to use for approximate balancing
+#' @param bound.gamma Whether upper bound on gamma should be imposed. This is
+#'             required to guarantee asymptotic normality, but increases computational cost.
+#' @param verbose whether the optimizer should print progress information
+#'
+#' @return ATE estimate, along with (optional) standard error estimate
+#'
+#' @export residualBalance.ate
+residualBalance.ate1 = function(X, Y, W,
+                               target.pop=c(0, 1),
+                               allow.negative.weights = FALSE,
+                               zeta=0.5,
+                               fit.method = c("elnet", "none", "ols"),
+                               alpha=0.9,
+                               scale.X = TRUE,
+                               estimate.se = FALSE,
+                               optimizer = c("mosek", "pogs", "pogs.dual", "quadprog"),
+                               bound.gamma = TRUE,
+                               verbose = FALSE) {
+  
+  fit.method = match.arg(fit.method)
+  optimizer = match.arg(optimizer)
+  
+  if (estimate.se & fit.method == "none") {
+    warning("Cannot estimate standard error with fit.method = none. Forcing estimate.se to FALSE.")
+    estimate.se = FALSE
+  }
+  
+  if (scale.X) {
+    scl = apply(X, 2, sd, na.rm = TRUE)
+    is.binary = apply(X, 2, function(xx) sum(xx == 0) + sum(xx == 1) == length(xx))
+    scl[is.binary] = 1
+    X.scl = scale(X, center = FALSE, scale = scl)
+  } else {
+    X.scl = X
+  }
+  
+  # we want ATE for these indices
+  target.idx = which(W %in% target.pop)
+  balance.target = colMeans(X.scl[target.idx,])
+  
+  if (setequal(target.pop, c(0, 1))) {
+    
+    est0 = residualBalance.mean1(X.scl[W==0,], Y[W==0], balance.target, allow.negative.weights, zeta, fit.method, alpha, optimizer=optimizer, bound.gamma=bound.gamma, verbose=verbose)
+    est1 = residualBalance.mean1(X.scl[W==1,], Y[W==1], balance.target, allow.negative.weights, zeta, fit.method, alpha, optimizer=optimizer, bound.gamma=bound.gamma, verbose=verbose)
+    
+  }else {
+    
+    stop("Invalid target.pop.")
+    
+  }
+  
+  tau.hat = est1[1] - est0[1]
+  var.hat = est1[2] + est0[2]
+  
+  if (estimate.se) {
+    return(c(tau.hat, sqrt(var.hat)))
+  } else {
+    return(tau.hat)
+  }
+}
+```
+
+
+## experiment
+```{r}
+run_exp<-function(type, alpha=0.9, ptreat=c(0.25, 0.75),
+                  n=200, p=1000, repli=100, seed=114514){
+  #create betas
+  Beta=c()
+  #very dense
+  beta = rnorm(p,3,1)
+  beta=beta/sqrt(sum(beta^2))*3
+  Beta=cbind(Beta,beta)
+  #dense
+  beta = 1/sqrt(1:p)
+  beta=beta/sqrt(sum(beta^2))*3
+  Beta=cbind(Beta,beta)
+  #harmonic
+  beta = 1/(9+(1:p))
+  beta=beta/sqrt(sum(beta^2))*3
+  Beta=cbind(Beta,beta)
+  #moderately sparse
+  beta = numeric(p)
+  beta[1:10]=10
+  beta[11:min(100,p)]=1
+  beta=beta/sqrt(sum(beta^2))*3
+  Beta=cbind(Beta,beta)
+  #very sparse
+  beta = numeric(p)
+  beta[1:10]=1
+  beta=beta/sqrt(sum(beta^2))*3
+  Beta=cbind(Beta,beta)
+  
+  #do experiment
+  err<-c()
+  for(count in 1:ncol(Beta)){
+    set.seed(seed)
+    
+    tau = 7
+    nclust = 20
+    beta = Beta[,count]
+    r <- foreach(icount(repli), .combine=rbind) %dorng% {
+      
+      clust.ptreat = rep(ptreat, nclust/2)
+      
+      cluster.center = 0.5 * matrix(rnorm(nclust * p), nclust, p)
+      cluster = sample.int(nclust, n, replace = TRUE)
+      X = cluster.center[cluster,] + matrix(rnorm(n * p), n, p)
+      W = rbinom(n, 1, clust.ptreat[cluster])
+      Y = X %*% beta + rnorm(n, 0, 1) + tau * W
+      
+      if(type==0){
+        residualBalance.ate(X, Y, W, optimizer = "quadprog", alpha=alpha, bound.gamma = F, estimate.se = F)
+      } else if(type==1){
+        residualBalance.ate1(X, Y, W, optimizer = "quadprog", alpha=alpha, bound.gamma = F, estimate.se = F)
+      } else if(type=="aipw"){
+        tau.aipw = ipw.ate(X, Y, W, target.pop = c(0,1), prop.weighted.fit = FALSE, targeting.method = "AIPW",
+	                   fit.method = "elnet", prop.method = "elnet", alpha.fit = 0.9, alpha.prop = 0.5)
+      } else if(type=="elnet"){
+        tau.elnet = elnet.ate(X, Y, W, target.pop = c(0,1), alpha = alpha)
+      } else if(type=="ipw"){
+        tau.ipw.elnet = ipw.ate(X, Y, W, target.pop = c(0,1), fit.method = "none", prop.method = "elnet", alpha.prop = 0.5)
+      }
+    }
+    err<-cbind(err, r-tau)
+  }
+  return(err)
+}
+```
+
+
+```{r}
+err01<-run_exp(0,1)
+```
+
+
+```{r}
+apply(err01,2,function(x)mean(abs(x)))
+apply(err01,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err0_0.5<-run_exp(0,0.5)
+```
+
+
+```{r}
+apply(err0_0.5,2,function(x)mean(abs(x)))
+apply(err0_0.5,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err1_0.5<-run_exp(1,0.5)
+```
+
+
+```{r}
+apply(err1_0.5,2,function(x)mean(abs(x)))
+apply(err1_0.5,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err10<-run_exp(1,0)
+```
+
+
+```{r}
+apply(err10,2,function(x)mean(abs(x)))
+apply(err10,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err01_p200<-run_exp(0,1,p=200)
+```
+
+
+```{r}
+apply(err01_p200,2,function(x)mean(abs(x)))
+apply(err01_p200,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err0_0.5_p200<-run_exp(0,0.5,p=200)
+```
+
+
+```{r}
+apply(err0_0.5_p200,2,function(x)mean(abs(x)))
+apply(err0_0.5_p200,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err10_p200<-run_exp(1,0,p=200)
+```
+
+
+```{r}
+apply(err10_p200,2,function(x)mean(abs(x)))
+apply(err10_p200,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err1_0.5_p200<-run_exp(1,0.5,p=200)
+```
+
+
+```{r}
+apply(err1_0.5_p200,2,function(x)mean(abs(x)))
+apply(err1_0.5_p200,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err01_p40<-run_exp(0,1,p=40)
+```
+
+
+```{r}
+apply(err01_p40,2,function(x)mean(abs(x)))
+apply(err01_p40,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err01_p40<-run_exp(0,1,p=40)
+```
+
+
+```{r}
+apply(err01_p40,2,function(x)mean(abs(x)))
+apply(err01_p40,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err0_0.5_p40<-run_exp(0,0.5,p=40)
+```
+
+
+```{r}
+apply(err0_0.5_p40,2,function(x)mean(abs(x)))
+apply(err0_0.5_p40,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err10_p40<-run_exp(1,0,p=40)
+```
+
+
+```{r}
+apply(err10_p40,2,function(x)mean(abs(x)))
+apply(err10_p40,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err1_0.5_p40<-run_exp(1,0.5,p=40)
+```
+
+
+```{r}
+apply(err1_0.5_p40,2,function(x)mean(abs(x)))
+apply(err1_0.5_p40,2,function(x)sqrt(mean(x^2)))
+```
+
+### elnet
+
+```{r}
+err.elnet<-run_exp("elnet")
+
+```
+
+```{r}
+apply(err.elnet,2,function(x)mean(abs(x)))
+apply(err.elnet,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err.elnet_p200<-run_exp("elnet",p=200)
+
+```
+
+```{r}
+apply(err.elnet_p200,2,function(x)mean(abs(x)))
+apply(err.elnet_p200,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err.elnet_p40<-run_exp("elnet",p=40)
+
+```
+
+```{r}
+apply(err.elnet_p40,2,function(x)mean(abs(x)))
+apply(err.elnet_p40,2,function(x)sqrt(mean(x^2)))
+```
+
+### ipw
+
+```{r}
+err.ipw<-run_exp("ipw")
+
+```
+
+```{r}
+apply(err.ipw,2,function(x)mean(abs(x)))
+apply(err.ipw,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err.ipw_p200<-run_exp("ipw",p=200)
+
+```
+
+```{r}
+apply(err.ipw_p200,2,function(x)mean(abs(x)))
+apply(err.ipw_p200,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err.ipw_p40<-run_exp("ipw",p=40)
+
+```
+
+```{r}
+apply(err.ipw_p40,2,function(x)mean(abs(x)))
+apply(err.ipw_p40,2,function(x)sqrt(mean(x^2)))
+```
+
+
+## exp1
+
+```{r}
+run_exp1<-function(type, alpha=0.9, ptreat=c(0.25, 0.75),
+                  n=200, p=1000, repli=100, seed=114514){
+  #create betas
+  Beta=c()
+  #very dense
+  beta = rnorm(p,3,1)
+  beta=beta/sqrt(sum(beta^2))*3
+  Beta=cbind(Beta,beta)
+  #dense
+  beta = 1/sqrt(1:p)
+  beta=beta/sqrt(sum(beta^2))*3
+  Beta=cbind(Beta,beta)
+  #harmonic
+  beta = 1/(9+(1:p))
+  beta=beta/sqrt(sum(beta^2))*3
+  Beta=cbind(Beta,beta)
+  #moderately sparse
+  beta = numeric(p)
+  beta[1:10]=10
+  beta[11:min(100,p)]=1
+  beta=beta/sqrt(sum(beta^2))*3
+  Beta=cbind(Beta,beta)
+  #very sparse
+  beta = numeric(p)
+  beta[1:10]=1
+  beta=beta/sqrt(sum(beta^2))*3
+  Beta=cbind(Beta,beta)
+  
+  #do experiment
+  err<-c()
+  for(count in 1:ncol(Beta)){
+    set.seed(seed)
+    
+    tau = 7
+    nclust = 20
+    beta = Beta[,count]
+    r <- foreach(icount(repli), .combine=rbind) %dorng% {
+      
+      clust.ptreat = rep(ptreat, nclust/2)
+      
+      cluster.center = 0.5 * matrix(rnorm(nclust * p), nclust, p)
+      cluster = sample.int(nclust, n, replace = TRUE)
+      X = cluster.center[cluster,] + matrix(rnorm(n * p), n, p)
+      W = rbinom(n, 1, clust.ptreat[cluster])
+      Y = log( 1 + exp(X %*% beta) ) + rnorm(n) + tau * W
+      
+      if(type==0){
+        residualBalance.ate(X, Y, W, optimizer = "quadprog", alpha=alpha, bound.gamma = F, estimate.se = F)
+      } else if(type==1){
+        residualBalance.ate1(X, Y, W, optimizer = "quadprog", alpha=alpha, bound.gamma = F, estimate.se = F)
+      } else if(type=="aipw"){
+        tau.aipw = ipw.ate(X, Y, W, target.pop = c(0,1), prop.weighted.fit = FALSE, targeting.method = "AIPW",
+	                   fit.method = "elnet", prop.method = "elnet", alpha.fit = 0.9, alpha.prop = 0.5)
+      } else if(type=="elnet"){
+        tau.elnet = elnet.ate(X, Y, W, target.pop = c(0,1), alpha = alpha)
+      } else if(type=="ipw"){
+        tau.ipw.elnet = ipw.ate(X, Y, W, target.pop = c(0,1), fit.method = "none", prop.method = "elnet", alpha.prop = 0.5)
+      }
+    }
+    err<-cbind(err, r-tau)
+  }
+  return(err)
+}
+```
+
+
+```{r}
+err01.exp1<-run_exp1(0,alpha=1,repli=100)
+```
+
+
+```{r}
+apply(err01.exp1,2,function(x)mean(abs(x)))
+apply(err01.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err10.exp1<-run_exp1(1,0,repli=100)
+```
+
+
+```{r}
+apply(err10.exp1,2,function(x)mean(abs(x)))
+apply(err10.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err0_0.5.exp1<-run_exp1(0,0.5)
+```
+
+
+```{r}
+apply(err0_0.5.exp1,2,function(x)mean(abs(x)))
+apply(err0_0.5.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err1_0.5.exp1<-run_exp1(1,0.5)
+```
+
+
+```{r}
+apply(err1_0.5.exp1,2,function(x)mean(abs(x)))
+apply(err1_0.5.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err.elnet.exp1<-run_exp1("elnet")
+
+```
+
+```{r}
+apply(err.elnet.exp1,2,function(x)mean(abs(x)))
+apply(err.elnet.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err.ipw.exp1<-run_exp1("ipw")
+
+```
+
+```{r}
+apply(err.ipw.exp1,2,function(x)mean(abs(x)))
+apply(err.ipw.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+### p=200
+
+```{r}
+err01_p200.exp1<-run_exp1(0,alpha=1,repli=100,p=200)
+```
+
+
+```{r}
+apply(err01_p200.exp1,2,function(x)mean(abs(x)))
+apply(err01_p200.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err10_p200.exp1<-run_exp1(1,0,repli=100,p=200)
+```
+
+
+```{r}
+apply(err10_p200.exp1,2,function(x)mean(abs(x)))
+apply(err10_p200.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+
+```{r}
+err0_0.5_p200.exp1<-run_exp1(0,0.5,p=200)
+```
+
+
+```{r}
+apply(err0_0.5_p200.exp1,2,function(x)mean(abs(x)))
+apply(err0_0.5_p200.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err1_0.5_p200.exp1<-run_exp1(1,0.5,p=200)
+```
+
+
+```{r}
+apply(err1_0.5_p200.exp1,2,function(x)mean(abs(x)))
+apply(err1_0.5_p200.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+err.elnet_p200.exp1<-run_exp1("elnet",p=200)
+
+```
+
+```{r}
+apply(err.elnet_p200.exp1,2,function(x)mean(abs(x)))
+apply(err.elnet_p200.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err.ipw_p200.exp1<-run_exp1("ipw",p=200)
+
+```
+
+```{r}
+apply(err.ipw_p200.exp1,2,function(x)mean(abs(x)))
+apply(err.ipw_p200.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+### p=40
+
+```{r}
+err01_p40.exp1<-run_exp1(0,alpha=1,repli=100,p=40)
+```
+
+
+```{r}
+apply(err01_p40.exp1,2,function(x)mean(abs(x)))
+apply(err01_p40.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err10_p40.exp1<-run_exp1(1,0,repli=100,p=40)
+```
+
+
+```{r}
+apply(err10_p40.exp1,2,function(x)mean(abs(x)))
+apply(err10_p40.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err0_0.5_p40.exp1<-run_exp1(0,0.5,p=40)
+```
+
+
+```{r}
+apply(err0_0.5_p40.exp1,2,function(x)mean(abs(x)))
+apply(err0_0.5_p40.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err1_0.5_p40.exp1<-run_exp1(1,0.5,p=40)
+```
+
+
+```{r}
+apply(err1_0.5_p40.exp1,2,function(x)mean(abs(x)))
+apply(err1_0.5_p40.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err.elnet_p40.exp1<-run_exp1("elnet",p=40)
+
+```
+
+```{r}
+apply(err.elnet_p40.exp1,2,function(x)mean(abs(x)))
+apply(err.elnet_p40.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+
+```{r}
+err.ipw_p40.exp1<-run_exp1("ipw",p=40)
+
+```
+
+```{r}
+apply(err.ipw_p40.exp1,2,function(x)mean(abs(x)))
+apply(err.ipw_p40.exp1,2,function(x)sqrt(mean(x^2)))
+```
+
+```{r}
+dostring<-function(string){
+               x<-round(as.numeric(strsplit(string,split=" ")[[1]]),3)
+               x<-as.character(x,3)
+               return(paste(x,collapse = " & "))
+               }
+dostring(string)
+```
+
+```{r}
+dostring("0.3066337 0.3235724 0.3270388 0.3371105 0.3373326")
+```
